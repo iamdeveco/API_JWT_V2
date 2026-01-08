@@ -8,3 +8,7 @@ PyJWT==2.8.0
 gunicorn==21.2.0
 waitress==2.1.2
 redis==5.0.1  
+httpx[http2]
+fastapi
+uvicorn
+httptools
