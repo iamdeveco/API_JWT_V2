@@ -127,12 +127,33 @@ def encrypt_message(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
     return cipher.encrypt(padded)
 
 def parse_response(content: str) -> Dict[str, str]:
+    """Parse response content into dictionary, handling multiple formats"""
     response_dict = {}
+    
+    # Try parsing as key-value pairs with colons
     lines = content.split("\n")
     for line in lines:
         if ":" in line:
             key, value = line.split(":", 1)
-            response_dict[key.strip()] = value.strip().strip('"')
+            key = key.strip()
+            value = value.strip().strip('"')
+            response_dict[key] = value
+    
+    # If no token found, try to extract from JSON-like structure
+    if "token" not in response_dict and "token" in content:
+        import re
+        # Look for token:value pattern
+        token_match = re.search(r'token["\']?\s*:\s*["\']?([^"\'\s,}]+)', content)
+        if token_match:
+            response_dict["token"] = token_match.group(1)
+    
+    # Also look for access_token
+    if "token" not in response_dict and "access_token" in content:
+        import re
+        access_token_match = re.search(r'access_token["\']?\s*:\s*["\']?([^"\'\s,}]+)', content)
+        if access_token_match:
+            response_dict["token"] = access_token_match.group(1)
+    
     return response_dict
 
 async def prepare_major_login(token_data: Dict[str, Any]) -> bytes:
@@ -215,6 +236,10 @@ async def parse_major_login_response(content: bytes) -> tuple[eco_LoginRes.Major
         jwt_msg.ParseFromString(content)
         jwt_dict = parse_response(str(jwt_msg))
         
+        # Debug logging
+        logger.info(f"JWT dict keys: {list(jwt_dict.keys())}")
+        logger.info(f"Token in JWT dict: {jwt_dict.get('token', 'NOT FOUND')}")
+        
         return login_res, jwt_dict
     
     return await asyncio.to_thread(_parse)
@@ -294,6 +319,9 @@ async def get_single_response(
             headers=headers
         )
         
+        # Debug: log the response
+        logger.info(f"MajorLogin response status: {response.status_code}")
+        
         if response.status_code != 200:
             raise HTTPException(
                 status_code=400,
@@ -303,8 +331,36 @@ async def get_single_response(
         # Parse response asynchronously
         login_res, jwt_dict = await parse_major_login_response(response.content)
         
-        # Get token
-        token = jwt_dict.get("token", "")
+        # Get token - ensure it's not empty
+        token = jwt_dict.get("token", "").strip()
+        if not token:
+            logger.error(f"Empty token received in response: {jwt_dict}")
+            # Build response with available data
+            response_data = {
+                "accountId": login_res.account_id if hasattr(login_res, 'account_id') else "",
+                "accountNickname": "", 
+                "accountRegion": "", 
+                "accountLevel": 0, 
+                "accountLevelExp": 0, 
+                "accountCreateAt": "", 
+                "lockRegion": login_res.lock_region if hasattr(login_res, 'lock_region') else "",
+                "notiRegion": login_res.noti_region if hasattr(login_res, 'noti_region') else "",
+                "ipRegion": login_res.ip_region if hasattr(login_res, 'ip_region') else "",
+                "agoraEnvironment": login_res.agora_environment if hasattr(login_res, 'agora_environment') else "",
+                "tokenStatus": "invalid",
+                "token": "", 
+                "ttl": login_res.ttl if hasattr(login_res, 'ttl') else 0,
+                "serverUrl": login_res.server_url if hasattr(login_res, 'server_url') else "",
+                "expireAt": int(time.time()),
+                "cached": False,
+                "responseTime": round(time.time() - start_time, 3),
+                "error": "Failed to obtain valid authentication token"
+            }
+            
+            # Cache the response
+            set_cached_response(uid, password, response_data)
+            
+            return JSONResponse(content=response_data)
         
         # Determine base URL
         base_url = None
@@ -327,6 +383,7 @@ async def get_single_response(
         encrypted_login = await encrypt_message_async(AES_KEY, AES_IV, serialized_login)
         login_hex = binascii.hexlify(encrypted_login).decode()
         
+        # Only set Authorization header if token is valid
         get_headers = headers.copy()
         get_headers["Authorization"] = f"Bearer {token}"
         
@@ -366,32 +423,24 @@ async def get_single_response(
         
         # Build response
         response_data = {
-            "accountId": login_res.account_id if login_res.account_id else "",
+            "accountId": login_res.account_id if hasattr(login_res, 'account_id') else "",
             "accountNickname": nickname, 
             "accountRegion": region, 
             "accountLevel": level, 
             "accountLevelExp": exp, 
             "accountCreateAt": create_at, 
-            "lockRegion": login_res.lock_region if login_res.lock_region else "",
-            "notiRegion": login_res.noti_region if login_res.noti_region else "",
-            "ipRegion": login_res.ip_region if login_res.ip_region else "",
-            "agoraEnvironment": login_res.agora_environment if login_res.agora_environment else "",
-            "tokenStatus": jwt_dict.get("status", "invalid"),
+            "lockRegion": login_res.lock_region if hasattr(login_res, 'lock_region') else "",
+            "notiRegion": login_res.noti_region if hasattr(login_res, 'noti_region') else "",
+            "ipRegion": login_res.ip_region if hasattr(login_res, 'ip_region') else "",
+            "agoraEnvironment": login_res.agora_environment if hasattr(login_res, 'agora_environment') else "",
+            "tokenStatus": jwt_dict.get("status", "valid"),
             "token": token, 
-            "ttl": login_res.ttl if login_res.ttl else 0,
-            "serverUrl": login_res.server_url if login_res.server_url else "",
-            "expireAt": int(time.time()) + (login_res.ttl if login_res.ttl else 0),
+            "ttl": login_res.ttl if hasattr(login_res, 'ttl') else 0,
+            "serverUrl": login_res.server_url if hasattr(login_res, 'server_url') else "",
+            "expireAt": int(time.time()) + (login_res.ttl if hasattr(login_res, 'ttl') else 0),
             "cached": False,
             "responseTime": round(time.time() - start_time, 3)
         }
-        
-        # Add optional fields if they exist
-        optional_fields = ['lockRegion', 'notiRegion', 'ipRegion', 'agoraEnvironment', 'ttl', 'serverUrl']
-        for field in optional_fields:
-            if hasattr(login_res, field):
-                value = getattr(login_res, field)
-                if value is not None:
-                    response_data[field] = value
         
         # Cache the response
         set_cached_response(uid, password, response_data)
